@@ -18,3 +18,7 @@ CSPT*
 .virtual_documents/
 .ipynb_checkpoints
 /.idea/
+<<<<<<< HEAD
+=======
+ECSPT.out
+>>>>>>> 6ab50b9 (Second commit)
