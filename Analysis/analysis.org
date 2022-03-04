@@ -1,0 +1,414 @@
+#+TITLE: Data Analysis
+#+SUBTITLE: Evaluating the Completeness of Social Preference Theories
+#+DESCRIPTION: This document contains the analysis from the paper "Evaluating the Completeness of Social Preference Theories"
+#+AUTHOR: Jesper Armouti-Hansen
+#+PROPERTY: header-args:jupyter-python :kernel sa :tangle analysis.py
+
+This document contains the main analysis as well as additional robustness checks from the paper "Evaluating the Completeness of Social Preference Theories". We thank Adrian Bruhin, Ernst Fehr and Daniel Schunk for sharing the data. We also thank Dirk Sliwka and Marco Mariotti for instructive and insightful comments. The analysis is conducted in Python using the libraries:
+- Numpy
+- Pandas
+- Scikit-Learn
+- Scipy
+- Matplotlib
+For the specific requirements in order to successfully replicate the results, we recommend creating a conda environment using the ~requirements.yml~ file. For any questions, comments or suggestions, please contact me on [[mailto:armoutihansen@uni-bonn.de][armoutihansen@uni-bonn.de]].
+* Imports and Data-splitting
+** Imports
+
+#+begin_src jupyter-python :results silent
+import numpy as np
+import pandas as pd
+from scipy.special import softmax, log_softmax
+from scipy.optimize import minimize
+from sklearn.metrics import log_loss
+from sklearn.model_selection import train_test_split, PredefinedSplit, RandomizedSearchCV
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.calibration import CalibratedClassifierCV
+from patsy import dmatrices, dmatrix
+#+end_src
+
+** Data-splitting function
+The following function ~split~ randomly splits (i) the data into a training and test set, (ii) the training set into five CV folds stratifying on the indicated column. The approach is slightly "hacky" as sklearn seemingly does not provide the possibility of creating stratified CV folds. The function returns a tuple consisting of (i) the training set, (ii) the test set, (iii) a list of CV iterations (to be manually used for RUMs and FMEs) and (iv) a predifined split indicator allowing for usage with predefined CV procedures of sklearn, e.g., ~RandomizedSearchCV~ and therefore also allowing for usage of all CPU threads when fitting the ML models.
+
+#+begin_src jupyter-python :results silent
+def split(data, strat_column='sid', random_state=181):
+
+    data[['self_z','other_z']] = data[['self_z','other_z']].fillna(0)
+
+    train, test = train_test_split(data,
+                                   train_size=0.7,
+                                   stratify=data[strat_column],
+                                   random_state=random_state,
+                                   shuffle=True)
+
+    temp, cv_fold_1 = train_test_split(train,
+                                       test_size=int(train.shape[0]*.2),
+                                       stratify=train[strat_column],
+                                       random_state=random_state,
+                                       shuffle=True)
+
+    temp1, cv_fold_2 = train_test_split(temp,
+                                        test_size=int(train.shape[0]*.2),
+                                        stratify=temp[strat_column],
+                                        random_state=random_state,
+                                        shuffle=True)
+
+    temp2, cv_fold_3 = train_test_split(temp1,
+                                        test_size=int(train.shape[0]*.2),
+                                        stratify=temp1[strat_column],
+                                        random_state=random_state,
+                                        shuffle=True)
+
+    temp3, cv_fold_4 = train_test_split(temp2,
+                                        test_size=int(train.shape[0]*.2),
+                                        stratify=temp2[strat_column],
+                                        random_state=random_state,
+                                        shuffle=True)
+
+    cv_fold_5 = temp3
+
+    # train =  pd.get_dummies(train, columns=['sid'])
+    # test = pd.get_dummies(test, columns=['sid'])
+    # cv_fold_1 =  pd.get_dummies(cv_fold_1, columns=['sid'])
+    # cv_fold_2 =  pd.get_dummies(cv_fold_2, columns=['sid'])
+    # cv_fold_3 =  pd.get_dummies(cv_fold_3, columns=['sid'])
+    # cv_fold_4 =  pd.get_dummies(cv_fold_4, columns=['sid'])
+    # cv_fold_5 =  pd.get_dummies(cv_fold_5, columns=['sid'])
+
+    iterations = [
+    [pd.concat([cv_fold_1,cv_fold_2,cv_fold_3,cv_fold_4]), cv_fold_5],
+    [pd.concat([cv_fold_1,cv_fold_2,cv_fold_3,cv_fold_5]), cv_fold_4],
+    [pd.concat([cv_fold_1,cv_fold_2,cv_fold_4,cv_fold_5]), cv_fold_3],
+    [pd.concat([cv_fold_1,cv_fold_3,cv_fold_4,cv_fold_5]), cv_fold_2],
+    [pd.concat([cv_fold_2,cv_fold_3,cv_fold_4,cv_fold_5]), cv_fold_1],
+               ]
+
+    def set_test_fold(row):
+        if row.idx in iterations[0][1].index.to_list():
+            return 0
+        elif row.idx in iterations[1][1].index.to_list():
+            return 1
+        elif row.idx in iterations[2][1].index.to_list():
+            return 2
+        elif row.idx in iterations[3][1].index.to_list():
+            return 3
+        else:
+            return 4
+
+    train['idx'] = train.index
+
+    test_fold = train.apply(set_test_fold, axis=1)
+
+    train = train.drop(columns=['idx'])
+
+    ps = PredefinedSplit(test_fold)
+
+    return (train, test, iterations, ps)
+#+end_src
+
+* Representative Agent
+First load the data and use the ~split~ function to create a training and test set as well as the CV folds.
+
+#+begin_src jupyter-python :results silent
+path_to_data = "/Users/armoutihansen/Dropbox/academics/papers/ECSPT/Analysis/Data/choices_exp1_ext.csv"
+
+data = pd.read_csv(path_to_data)[['sid','gid', 'choice_x','self_x',
+                                                   'other_x','self_y','other_y',
+                                                   'self_z','other_z']]
+train, test, iterations, ps = split(data)
+#+end_src
+
+** ML Benchmarks
+To estimate the irreducible loss, we try use five different algorithms, with optimal hyperparameters picked in a five fold CV procedure when relevant, and choosing the one with the lowest estimated expected loss as our estimate of the irreducible loss. The algorithms that we are using are:
+
+1. Table Lookup Algorithm [[cite:&Fudenberg2021b]]
+2. Logistic regression
+3. Random forest
+4. Gradient boosting
+5. Multi-layer Perceptron
+
+*** Table Lookup Algorithm
+#+begin_src jupyter-python
+temp = train.groupby(['gid']).mean()
+temp['pred_x'] = temp['choice_x']
+temp = pd.merge(test, temp['pred_x'], on=['gid'])
+y_test, y_pred = temp['choice_x'], temp['pred_x']
+loss_tba = log_loss(y_test, y_pred)
+
+print("Table Lookup Algorithm loss: {:.4f}".format(loss_tba))
+#+end_src
+
+#+RESULTS:
+: Table Lookup Algorithm loss: 0.3651
+
+*** Logistic Regression
+#+begin_src jupyter-python
+X_cols = ['self_x','other_x','self_y','other_y','self_z','other_z']
+
+X_train, X_test = train[X_cols], test[X_cols]
+y_train, y_test = train['choice_x'], test['choice_x']
+
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+poly = PolynomialFeatures(3)
+X_train = poly.fit_transform(X_train)
+X_test = poly.fit_transform(X_test)
+
+# X_train = dmatrix(
+#     '(self_x + other_x + self_y + other_y + self_z + other_z)**3 \
+#     + (I(self_x**2) + I(self_y**2) + I(self_z**2) + I(other_x**2) + I(other_y**2) + I(other_z**2))**2 \
+#     + (I(self_x**3) + I(self_y**3) + I(self_z**3) + I(other_x**3) + I(other_y**3) + I(other_z**3))**2',
+# data=train)
+# X_test = dmatrix(
+#     '(self_x + other_x + self_y + other_y + self_z + other_z)**3 \
+#     + (I(self_x**2) + I(self_y**2) + I(self_z**2) + I(other_x**2) + I(other_y**2) + I(other_z**2))**2 \
+#     + (I(self_x**3) + I(self_y**3) + I(self_z**3) + I(other_x**3) + I(other_y**3) + I(other_z**3))**2',
+# data=test)
+
+logreg = LogisticRegressionCV(Cs=100,
+                              cv=ps,
+                              solver='newton-cg',
+                              scoring='log_loss',
+                              random_state=181,
+                              n_jobs=-1).fit(X_train, y_train)
+
+y_pred = logreg.predict_proba(X_test)
+loss_logreg = log_loss(y_test,y_pred)
+print("Logistic Regression loss: {:.4f}".format(loss_logreg))
+#+end_src
+
+#+RESULTS:
+: d22e5f0a-1b07-422a-b160-a117c264cb9b
+
+#+begin_src jupyter-python
+logreg.scores_
+#+end_src
+
+#+RESULTS:
+:RESULTS:
+| 1: | array | (((0.83578947 0.83719298 0.84105263 0.83929825 0.83929825 0.83929825 0.83929825 0.83929825 0.83929825 0.83824561 0.83824561 0.84105263 0.84105263 0.84105263 0.84105263 0.84105263 0.84105263 0.84105263 0.84666667 0.84666667 0.85298246 0.85298246 0.85298246 0.85263158 0.85263158 0.8554386 0.8554386 0.8554386 0.8554386 0.8554386 0.8554386 0.8554386 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.86140351 0.86140351 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439 0.86175439) (0.85368421 0.86175439 0.86175439 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85964912 0.85754386 0.85684211 0.86140351 0.86140351 0.86140351 0.86140351 0.86140351 0.86140351 0.86807018 0.86807018 0.86807018 0.86807018 0.86807018 0.86736842 0.86736842 0.87052632 0.87052632 0.87052632 0.87052632 0.87052632 0.87122807 0.87122807 0.87122807 0.87438596 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87649123 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87859649 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825 0.87929825) (0.84421053 0.85052632 0.85052632 0.85052632 0.84912281 0.84912281 0.84912281 0.84912281 0.84912281 0.84877193 0.84877193 0.84877193 0.84877193 0.85719298 0.85719298 0.85719298 0.85754386 0.85754386 0.86561404 0.86561404 0.86561404 0.86561404 0.86561404 0.86736842 0.86736842 0.86736842 0.86701754 0.87052632 0.87052632 0.87052632 0.87052632 0.87438596 0.87438596 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87473684 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87614035 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596 0.87438596) (0.84877193 0.85157895 0.85263158 0.85263158 0.85263158 0.85263158 0.85263158 0.85263158 0.85263158 0.85263158 0.85368421 0.85368421 0.85192982 0.85192982 0.85192982 0.85473684 0.85473684 0.86070175 0.86070175 0.86070175 0.86070175 0.85649123 0.85649123 0.85824561 0.85824561 0.85824561 0.85824561 0.85824561 0.8645614 0.8645614 0.8645614 0.86631579 0.86631579 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87157895 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246 0.87298246) (0.81473684 0.83508772 0.83824561 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84 0.84491228 0.85087719 0.85087719 0.85087719 0.85087719 0.84947368 0.84947368 0.84947368 0.84947368 0.85403509 0.85403509 0.85403509 0.85403509 0.85473684 0.85473684 0.85473684 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85894737 0.85719298 0.85719298 0.85719298 0.85719298 0.85719298 0.85719298 0.85719298 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649 0.85859649))) |
+: ERROR! Session/line number was not unique in database. History logging moved to new session 5
+:END:
+
+#+begin_src jupyter-python
+ X_cols = ['self_x','other_x','self_y','other_y','self_z','other_z']
+
+ X_train, X_test = train[X_cols], test[X_cols]
+
+ poly = PolynomialFeatures(3)
+ X_train_ = poly.fit_transform(X_train)
+ print(X_train_.shape)
+
+
+X_train = dmatrix(
+    '(self_x + other_x + self_y + other_y + self_z + other_z)**3 \
+    + (I(self_x**2) + I(self_y**2) + I(self_z**2) + I(other_x**2) + I(other_y**2) + I(other_z**2))**2 \
+    + (I(self_x**3) + I(self_y**3) + I(self_z**3) + I(other_x**3) + I(other_y**3) + I(other_z**3))**2',
+data=train)
+print(X_train.shape)
+#+end_src
+
+#+RESULTS:
+: (14250, 84)
+: (14250, 84)
+
+#+begin_src jupyter-python
+X = np.arange(9).reshape(3, 3)
+print(X)
+poly = PolynomialFeatures(3)
+poly.fit_transform(X)
+#+end_src
+
+#+RESULTS:
+:RESULTS:
+: [[0 1 2]
+:  [3 4 5]
+:  [6 7 8]]
+: array([[  1.,   0.,   1.,   2.,   0.,   0.,   0.,   1.,   2.,   4.,   0.,
+:           0.,   0.,   0.,   0.,   0.,   1.,   2.,   4.,   8.],
+:        [  1.,   3.,   4.,   5.,   9.,  12.,  15.,  16.,  20.,  25.,  27.,
+:          36.,  45.,  48.,  60.,  75.,  64.,  80., 100., 125.],
+:        [  1.,   6.,   7.,   8.,  36.,  42.,  48.,  49.,  56.,  64., 216.,
+:         252., 288., 294., 336., 384., 343., 392., 448., 512.]])
+:END:
+
+*** Random Forest
+*** Gradient Boosting
+We first define the grid of potential hyperparameter candidates and then perform a 5-fold Random Search CV procedure that randomly selects 500 hyperparameter candidates and performs the CV procedure for each. The best candidates are then used to train the Gradient Boosting algorithm on the training set.
+
+#+begin_src jupyter-python :results silent
+X_cols = ['self_x','other_x','self_y','other_y','self_z','other_z']
+
+X_train, X_test = train[X_cols], test[X_cols]
+y_train, y_test = train['choice_x'], test['choice_x']
+
+param_grid = {
+    'n_estimators':range(100,1000),
+    'max_depth':range(1,20),
+    'learning_rate':np.linspace(0.001,1,1000)
+}
+
+clf = RandomizedSearchCV(GradientBoostingClassifier(random_state=181, verbose=True),
+                         param_grid,cv=ps,
+                         random_state=181,
+                         n_jobs=-1, # This allows using all CPU threads
+                         verbose=True,
+                         n_iter=500, # We pick 500 random candidates -> 5*500=2,500 estimations
+                         scoring='neg_log_loss')
+
+clf.fit(X_train, y_train)
+#+end_src
+
+Once we have found the optimal model and performed our estimations on the training set, we evaluate its predictions on the test set.
+
+#+begin_src jupyter-python
+clf.best_estimator_.fit(X_train, y_train)
+y_pred = clf.best_estimator_.predict_proba(X_test)
+print(log_loss(y_test, y_pred))
+#+end_src
+
+*** Multi-layer Perceptron
+** Random Utility Models
+** Results
+** Robustness
+*** Calibration of ML probability estimates
+*** Non-linear utility
+*** Non-linear altruism
+*** Non-binary reciprocity
+* Heterogeneity
+** ML Benchmarks
+*** Logistic Regression
+**** Subject ID
+***** L1 Penalty
+***** L2 Penalty
+#+begin_src jupyter-python
+train.head()
+#+end_src
+
+#+RESULTS:
+#+begin_example
+       gid  choice_x  self_x  other_x  self_y  other_y  self_z  other_z  \
+15446  500         1     470      730     190     1010   610.0    590.0
+11617  340         0     870      140     870      520   730.0    660.0
+5212   151         1     700      760     500      440     0.0      0.0
+9038   261         1     790      600     410      600     0.0      0.0
+11349  331         1     960      500     780      160     0.0      0.0
+
+       sid_12010050501  sid_12010050502  ...  sid_302010050502  \
+15446                0                0  ...                 0
+11617                0                0  ...                 0
+5212                 0                0  ...                 0
+9038                 0                0  ...                 1
+11349                0                0  ...                 0
+
+       sid_302010050705  sid_312010050501  sid_312010050502  sid_312010050705  \
+15446                 0                 0                 0                 0
+11617                 0                 0                 0                 0
+5212                  0                 1                 0                 0
+9038                  0                 0                 0                 0
+11349                 0                 0                 0                 0
+
+       sid_322010050501  sid_332010050501  sid_342010050501  sid_352010050501  \
+15446                 0                 0                 0                 0
+11617                 0                 0                 0                 0
+5212                  0                 0                 0                 0
+9038                  0                 0                 0                 0
+11349                 0                 0                 0                 0
+
+       sid_362010050501
+15446                 0
+11617                 0
+5212                  0
+9038                  0
+11349                 0
+
+[5 rows x 182 columns]
+#+end_example
+
+#+begin_src jupyter-python
+470*190
+#+end_src
+
+#+RESULTS:
+: 89300
+
+#+begin_src jupyter-python
+print(data.head())
+#+end_src
+
+#+RESULTS:
+: 2b8135c4-aa83-4cc8-ace2-d342ed844ef6
+
+#+begin_src jupyter-python
+# temp_X_train_1 = train[['self_x', 'self_y','self_z','other_x','other_y','other_z']]
+# poly1 = PolynomialFeatures(2, include_bias=False)
+# cols = ['self_x','self_y','self_z','other_x','other_y','other_z',
+        # 'self_x_2','self_x_self_y']
+
+X_train_ = train.drop(columns=['choice_x','gid'])
+cols = ['self_x','self_y','self_z','other_x','other_y','other_z']
+# mapper = DataFrameMapper(cols, PolynomialFeatures(2, include_bias=False))
+# X_train_1 = mapper.fit_transform(X_train_)
+
+X_t = train[cols]
+X_tt = X_t.transform(lambda x: x**2)
+X_tt.head()
+# from sklearn.compose import make_column_transformer
+# from sklearn.compose import make_column_selector
+# ct = make_column_transformer(
+#     (PolynomialFeatures(2),
+#      make_column_selector(pattern=r'(?!sid_*)')),
+#     (PolynomialFeatures(3),
+#      make_column_selector(pattern=r'sid'))
+# )
+# d = ct.fit_transform(X_train_)
+# print(d.shape)
+# X_train_[cols]
+# poly1.fit_transform(X_train_[cols])
+# X_train_1 = poly1.fit_transform(temp_X_train_1)
+# X_train_2 = train.drop(columns=['choice_x','self_x','self_y','self_z','other_x','other_y','other_z','gid'])
+
+# X_train_ = pd.concat([pd.DataFrame(X_train_1),X_train_2],axis=1)
+# pd.DataFrame(X_train_1, columns=)
+# poly2 = PolynomialFeatures(interaction_only=True)
+# X_train = poly2.fit_transform(X_train_)
+# pd.DataFrame(X_train_1)
+
+# X_cols = ['self_x','other_x','self_y','other_y','self_z','other_z']
+
+# X_train, X_test = train[X_cols], test[X_cols]
+# y_train, y_test = train['choice_x'], test['choice_x']
+
+# poly = PolynomialFeatures(3)
+# X_train_ = poly.fit_transform(X_train)
+# X_test_ = poly.fit_transform(X_test)
+
+# logreg = LogisticRegressionCV(Cs=100,
+#                               cv=ps,
+#                               solver='liblinear',
+#                               random_state=181,
+#                               n_jobs=-1).fit(X_train_, y_train)
+#+end_src
+
+#+RESULTS:
+: f67221cf-a9fd-49fd-a8a5-f5a41bec0fd9
+
+***** Elastic net
+**** Clustered
+*** Gradient Boosting
+** Finite Mixture Models
+** Results
+** Robustness
+* Type predictability
+
+# bibliography:../bib.bib
+
+* Comment :noexport:
+### Local Variables:
+### eval: (make-variable-buffer-local 'org-export-babel-evaluate)
+### eval: (setq org-export-babel-evaluate nil)
+### End:
