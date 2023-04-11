@@ -5,7 +5,7 @@
 return 'hello'
 #+end_src
 
-#+begin_src jupyter-python :session py :kernel sa
+#+begin_src jupyter-python :session py :kernel sa :exports both
 %matplotlib inline
 import numpy
 import matplotlib.pyplot as plt
@@ -16,6 +16,6 @@ plt.plot(x,y)
 
 #+RESULTS:
 :RESULTS:
-| <matplotlib.lines.Line2D | at | 0x11cc9eaf0> |
+| <matplotlib.lines.Line2D | at | 0x11ce15e80> |
 [[file:./.ob-jupyter/da068ff6411299e8fcc98e377f7eb08baefb2069.png]]
 :END:
